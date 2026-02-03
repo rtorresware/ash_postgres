@@ -706,6 +706,9 @@ defmodule AshPostgres.DataLayer do
   def can?(resource, {:atomic, :upsert}),
     do: not AshPostgres.DataLayer.Info.repo(resource, :mutate).disable_atomic_actions?()
 
+  def can?(resource, {:atomic, :create}),
+    do: not AshPostgres.DataLayer.Info.repo(resource, :mutate).disable_atomic_actions?()
+
   def can?(_, :upsert), do: true
   def can?(_, :changeset_filter), do: true
 
@@ -2099,7 +2102,10 @@ defmodule AshPostgres.DataLayer do
           opts
         end
 
-      ecto_changesets = Enum.map(changesets, & &1.attributes)
+      ecto_changesets =
+        Enum.map(changesets, fn changeset ->
+          process_create_atomics(resource, changeset)
+        end)
 
       opts =
         if schema = Enum.at(changesets, 0).context[:data_layer][:schema] do
@@ -3829,6 +3835,69 @@ defmodule AshPostgres.DataLayer do
       {table, resource}
     else
       resource
+    end
+  end
+
+  # Wraps a dynamic expression in a subquery for use as an INSERT value.
+  # Ecto's insert_all accepts Ecto.Query as values, which get rendered as subqueries.
+  defp dynamic_to_insert_subquery(dynamic) do
+    import Ecto.Query
+    from(_x in fragment("(SELECT 1)"), select: ^dynamic)
+  end
+
+  # Converts a single create_atomic expression to a value suitable for insert_all.
+  # Returns the subquery or raises on error.
+  defp create_atomic_to_insert_value(resource, changeset, {key, expr}) do
+    import Ecto.Query
+
+    # Hydrate the expression to convert Ash.Query.Call structs to proper function structs
+    # This is similar to what do_hydrate_atomic_refs does for update atomics
+    expr =
+      case Ash.Filter.hydrate_refs(expr, %{resource: resource, public?: false}) do
+        {:ok, hydrated_expr} -> hydrated_expr
+        {:error, error} -> raise Ash.Error.to_ash_error(error)
+      end
+
+    source = resolve_source(resource, changeset)
+    # Build a query with proper bindings for expression evaluation
+    query = from(row in source, as: ^0)
+
+    query =
+      AshSql.Bindings.default_bindings(
+        query,
+        resource,
+        AshPostgres.SqlImplementation,
+        changeset.context
+      )
+
+    attribute = Ash.Resource.Info.attribute(resource, key)
+
+    type =
+      case AshPostgres.SqlImplementation.storage_type(resource, attribute.name) do
+        nil -> {attribute.type, attribute.constraints}
+        storage_type -> storage_type
+      end
+
+    {dynamic, _acc} = AshSql.Expr.dynamic_expr(query, expr, query.__ash_bindings__, false, type)
+    dynamic_to_insert_subquery(dynamic)
+  end
+
+  # Processes all create_atomics for a changeset and merges them with attributes.
+  # Returns updated attributes map with atomics converted to subqueries.
+  defp process_create_atomics(resource, changeset) do
+    # create_atomics field was added in Ash 3.14+ - gracefully handle older versions
+    create_atomics = Map.get(changeset, :create_atomics, [])
+
+    if create_atomics == [] do
+      changeset.attributes
+    else
+      atomic_values =
+        Enum.reduce(create_atomics, %{}, fn {key, expr}, acc ->
+          subquery = create_atomic_to_insert_value(resource, changeset, {key, expr})
+          Map.put(acc, key, subquery)
+        end)
+
+      Map.merge(changeset.attributes, atomic_values)
     end
   end
 end

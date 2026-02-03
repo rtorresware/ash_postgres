@@ -92,39 +92,30 @@ defmodule AshPostgres.Test.Post do
     end
   end
 
-  policies do
-    bypass action_type(:read) do
-      # Check that the post is in the same org as actor
-      authorize_if(relates_to_actor_via([:organization, :users]))
+  postgres do
+    table "posts"
+    repo AshPostgres.TestRepo
+    base_filter_sql "type = 'sponsored'"
+
+    calculations_to_sql upper_thing: "UPPER(uniq_on_upper)"
+    identity_wheres_to_sql uniq_if_contains_foo: "(uniq_if_contains_foo LIKE '%foo%')"
+
+    check_constraints do
+      check_constraint :price, "price_must_be_positive",
+        message: "yo, bad price",
+        check: "price > 0"
     end
 
-    policy action(:read_with_policy_with_parent) do
-      authorize_if(
-        relates_to_actor_via([:posts_with_my_organization_name_as_a_title, :organization, :users])
-      )
+    custom_indexes do
+      index [:uniq_custom_one, :uniq_custom_two],
+        unique: true,
+        concurrently: true,
+        message: "dude what the heck"
     end
+  end
 
-    policy action(:allow_any) do
-      authorize_if(always())
-    end
-
-    policy action(:requires_initial_data) do
-      authorize_if(PassIfOriginalDataPresent)
-    end
-
-    bypass action(:update_if_author) do
-      authorize_if(relates_to_actor_via(:author))
-    end
-
-    policy action_type(:update) do
-      authorize_if(action(:requires_initial_data))
-      authorize_if(relates_to_actor_via([:author, :authors_with_same_first_name]))
-      authorize_unless(changing_attributes(title: [from: "good", to: "bad"]))
-    end
-
-    policy action(:create) do
-      authorize_unless(changing_attributes(title: [to: "worst"]))
-    end
+  resource do
+    base_filter(expr(type == type(:sponsored, ^Ash.Type.Atom)))
   end
 
   field_policies do
@@ -133,32 +124,15 @@ defmodule AshPostgres.Test.Post do
     end
   end
 
-  postgres do
-    table("posts")
-    repo(AshPostgres.TestRepo)
-    base_filter_sql("type = 'sponsored'")
+  code_interface do
+    define(:create, args: [:title])
+    define(:get_by_id, action: :read, get_by: [:id])
+    define(:increment_score, args: [{:optional, :amount}])
+    define(:destroy)
+    define(:update_if_author)
+    define(:update_constrained_int, args: [:amount])
 
-    calculations_to_sql(upper_thing: "UPPER(uniq_on_upper)")
-    identity_wheres_to_sql(uniq_if_contains_foo: "(uniq_if_contains_foo LIKE '%foo%')")
-
-    check_constraints do
-      check_constraint(:price, "price_must_be_positive",
-        message: "yo, bad price",
-        check: "price > 0"
-      )
-    end
-
-    custom_indexes do
-      index([:uniq_custom_one, :uniq_custom_two],
-        unique: true,
-        concurrently: true,
-        message: "dude what the heck"
-      )
-    end
-  end
-
-  resource do
-    base_filter(expr(type == type(:sponsored, ^Ash.Type.Atom)))
+    define_calculation(:upper_title, args: [:title])
   end
 
   actions do
@@ -560,13 +534,49 @@ defmodule AshPostgres.Test.Post do
     end
   end
 
-  identities do
-    identity(:uniq_one_and_two, [:uniq_one, :uniq_two])
-    identity(:uniq_on_upper, [:upper_thing])
-
-    identity(:uniq_if_contains_foo, [:uniq_if_contains_foo]) do
-      where expr(contains(uniq_if_contains_foo, "foo"))
+  policies do
+    bypass action_type(:read) do
+      # Check that the post is in the same org as actor
+      authorize_if(relates_to_actor_via([:organization, :users]))
     end
+
+    policy action(:read_with_policy_with_parent) do
+      authorize_if(
+        relates_to_actor_via([
+          :posts_with_my_organization_name_as_a_title,
+          :organization,
+          :users
+        ])
+      )
+    end
+
+    policy action(:allow_any) do
+      authorize_if(always())
+    end
+
+    policy action(:requires_initial_data) do
+      authorize_if(PassIfOriginalDataPresent)
+    end
+
+    bypass action(:update_if_author) do
+      authorize_if(relates_to_actor_via(:author))
+    end
+
+    policy action_type(:update) do
+      authorize_if(action(:requires_initial_data))
+      authorize_if(relates_to_actor_via([:author, :authors_with_same_first_name]))
+      authorize_unless(changing_attributes(title: [from: "good", to: "bad"]))
+    end
+
+    policy action(:create) do
+      authorize_unless(changing_attributes(title: [to: "worst"]))
+    end
+  end
+
+  validations do
+    validate(attribute_does_not_equal(:title, "not allowed"),
+      where: [negate(action_is(:dont_validate))]
+    )
   end
 
   attributes do
@@ -574,7 +584,7 @@ defmodule AshPostgres.Test.Post do
 
     attribute(:version, :integer, allow_nil?: false, default: 1)
 
-    attribute(:title, :string) do
+    attribute :title, :string do
       public?(true)
       source(:title_column)
     end
@@ -656,44 +666,31 @@ defmodule AshPostgres.Test.Post do
     )
   end
 
-  code_interface do
-    define(:create, args: [:title])
-    define(:get_by_id, action: :read, get_by: [:id])
-    define(:increment_score, args: [{:optional, :amount}])
-    define(:destroy)
-    define(:update_if_author)
-    define(:update_constrained_int, args: [:amount])
-
-    define_calculation(:upper_title, args: [:title])
-  end
-
   relationships do
     belongs_to :organization, AshPostgres.Test.Organization do
       public?(true)
       attribute_writable?(true)
     end
 
-    belongs_to(:current_user_author, AshPostgres.Test.Author) do
+    belongs_to :current_user_author, AshPostgres.Test.Author do
       source_attribute(:author_id)
       define_attribute?(false)
       filter(expr(^actor(:id) == id))
     end
 
-    has_many(:posts_with_my_organization_name_as_a_title, __MODULE__) do
+    has_many :posts_with_my_organization_name_as_a_title, __MODULE__ do
       public?(true)
       no_attributes?(true)
       filter(expr(fragment("? = ?", title, parent(organization.name))))
     end
 
-    has_many(
-      :organizations_with_posts_that_have_the_post_title_somewhere_in_their_comments,
-      AshPostgres.Test.Organization
-    ) do
+    has_many :organizations_with_posts_that_have_the_post_title_somewhere_in_their_comments,
+             AshPostgres.Test.Organization do
       no_attributes?(true)
       filter(expr(fragment("POSITION(? IN ?) > 0", posts.title, parent(concated_comment_titles))))
     end
 
-    has_many(:recommendations, __MODULE__) do
+    has_many :recommendations, __MODULE__ do
       public?(true)
       no_attributes?(true)
       sort([calc(parent(datetime) > now())])
@@ -703,7 +700,7 @@ defmodule AshPostgres.Test.Post do
       public?(true)
     end
 
-    belongs_to(:author, AshPostgres.Test.Author) do
+    belongs_to :author, AshPostgres.Test.Author do
       public?(true)
     end
 
@@ -893,7 +890,7 @@ defmodule AshPostgres.Test.Post do
       sort(importance: :desc)
     end
 
-    has_many(:views, AshPostgres.Test.PostView) do
+    has_many :views, AshPostgres.Test.PostView do
       public?(true)
     end
 
@@ -910,12 +907,6 @@ defmodule AshPostgres.Test.Post do
       allow_nil?(true)
       attribute_type(AshPostgres.Test.StringPoint)
     end
-  end
-
-  validations do
-    validate(attribute_does_not_equal(:title, "not allowed"),
-      where: [negate(action_is(:dont_validate))]
-    )
   end
 
   calculations do
@@ -1032,11 +1023,14 @@ defmodule AshPostgres.Test.Post do
       expr(count(comments, query: [filter: expr(title == "baz")]))
     )
 
-    calculate(
-      :max_comment_similarity,
-      :float,
-      expr(max(comments, expr_type: :float, expr: fragment("similarity(?, ?)", title, ^arg(:to))))
-    ) do
+    calculate :max_comment_similarity,
+              :float,
+              expr(
+                max(comments,
+                  expr_type: :float,
+                  expr: fragment("similarity(?, ?)", title, ^arg(:to))
+                )
+              ) do
       argument(:to, :string, allow_nil?: false)
     end
 
@@ -1052,22 +1046,20 @@ defmodule AshPostgres.Test.Post do
 
     calculate(:c_times_p, :integer, expr(count_of_comments * count_of_linked_posts))
 
-    calculate(
-      :literal_map_in_expr,
-      :map,
-      expr(
-        cond do
-          title == "match" ->
-            %{match: true, of: "match"}
+    calculate :literal_map_in_expr,
+              :map,
+              expr(
+                cond do
+                  title == "match" ->
+                    %{match: true, of: "match"}
 
-          title == "not-match" ->
-            %{match: true, of: "not-match"}
+                  title == "not-match" ->
+                    %{match: true, of: "not-match"}
 
-          true ->
-            %{match: false}
-        end
-      )
-    ) do
+                  true ->
+                    %{match: false}
+                end
+              ) do
       constraints(fields: [match: [type: :boolean], of: [type: :string]])
     end
 
@@ -1246,7 +1238,7 @@ defmodule AshPostgres.Test.Post do
     min(:lowest_comment_rating, [:comments, :ratings], :score)
     avg(:avg_comment_rating, [:comments, :ratings], :score)
 
-    custom(:comment_authors, [:comments, :author], :string) do
+    custom :comment_authors, [:comments, :author], :string do
       implementation({AshPostgres.Test.StringAgg, field: :first_name, delimiter: ","})
     end
 
@@ -1382,6 +1374,15 @@ defmodule AshPostgres.Test.Post do
 
     count :count_of_comments_with_high_ratings, :comments do
       filter(expr(latest_rating_score > 5))
+    end
+  end
+
+  identities do
+    identity(:uniq_one_and_two, [:uniq_one, :uniq_two])
+    identity(:uniq_on_upper, [:upper_thing])
+
+    identity :uniq_if_contains_foo, [:uniq_if_contains_foo] do
+      where expr(contains(uniq_if_contains_foo, "foo"))
     end
   end
 end
